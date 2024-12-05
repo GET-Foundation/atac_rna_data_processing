@@ -2,7 +2,7 @@
 from numpy import dtype, save
 from atac_rna_data_processing.io.region import *
 from atac_rna_data_processing.io.atac import read_bed4
-
+#%%
 hg38 = Genome('hg38', 'hg38.fa')
 #%%
 atac = read_bed4("test.atac.bed").as_df().head(100000)
@@ -25,11 +25,36 @@ import zarr
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import zarr
+
+# {
+#     "chunks": [
+#         2000000
+#     ],
+#     "compressor": {
+#         "blocksize": 0,
+#         "clevel": 5,
+#         "cname": "zstd",
+#         "id": "blosc",
+#         "shuffle": 2
+#     },
+#     "dtype": "<U1",
+#     "fill_value": "",
+#     "filters": null,
+#     "order": "C",
+#     "shape": [
+#         248956422
+#     ],
+#     "zarr_format": 2
+# }
+
 def save_zarr_worker(self, zarr_file_path, chr, chrom_sizes):
     zarr_file = zarr.open_group(zarr_file_path, mode='a')  # open in append mode
-    data = self.get_sequence(chr, 0, chrom_sizes[chr]).one_hot
-    zarr_file.create_dataset(chr, data=data, chunks=(2000000, 4), 
-                             dtype='i4', compressor=zarr.Blosc(cname='zstd', clevel=3, shuffle=2))
+    data = self.genome_seq.get_seq(chr, 1, chrom_sizes[chr]).seq.lower()
+    # save string as list of characters
+    data = list(data)
+    zarr_file.create_dataset(chr, data=data, chunks=2000000, shape=len(data),
+                             dtype='<U1', compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=2))
+    return data
 
 def save_zarr(self, zarr_file_path, 
               included_chromosomes=['chr1', 'chr2', 'chr3', 'chr4', 'chr5', 'chr6', 'chr7',
@@ -58,4 +83,14 @@ def save_zarr(self, zarr_file_path,
     return
 # %%
 save_zarr(hg38, "hg38.zarr")
+# %%
+mm10 = Genome('mm10', '/home/xf2217/Projects/common/mm10/bigZips/mm10.fa')
+# %%
+save_zarr(mm10, "/home/xf2217/Projects/get_data/mm10_zstd.zarr/chrs", 
+               included_chromosomes=[c for c in mm10.chrom_sizes.keys() if len(c) < 6])
+# %%
+seq= save_zarr_worker(mm10, "/home/xf2217/Projects/get_data/mm10_zstd.zarr/chrs", "chr1", mm10.chrom_sizes)
+
+#%%
+np.unique(mm10.genome_seq.get_seq('chr1', 15100000, 15200000).seq)
 # %%
