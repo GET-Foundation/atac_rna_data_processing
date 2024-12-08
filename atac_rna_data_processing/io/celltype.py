@@ -1,3 +1,4 @@
+import logging
 import os
 from io import BytesIO
 
@@ -24,6 +25,7 @@ from plotly.subplots import make_subplots
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.stats import zscore
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 motif = NrMotifV1.load_from_pickle(
     pkg_resources.resource_filename(
@@ -56,7 +58,16 @@ class Celltype:
         num_cls=2,
         s3_file_sys=None,
     ):
-        self.celltype = celltype
+        self._gene_by_motif = None
+        self.tss_accessibility = None
+        self.input = None
+        self.input_all = None
+        self.embed = None
+        self.jacobs = None
+        self.preds = None
+        self.obs = None
+        self._zarr_data = None
+        self.celltype_name = celltype
         self.data_dir = data_dir
         self.interpret_dir = interpret_dir
         self.assets_dir = assets_dir
@@ -393,7 +404,7 @@ class Celltype:
             else:
                 jacobs = []
                 for g in tqdm(self.gene_annot.gene_name.unique()):
-                    for j in self.get_gene_jacobian(g):
+                    for j in self.get_gene_jacobian(g, multiply_input=True):
                         jacobs.append(j.motif_summary().T)
                 jacobs_df = pd.concat(jacobs, axis=1).T
                 # save to zarr
@@ -410,7 +421,7 @@ class Celltype:
         else:
             jacobs = []
             for g in tqdm(self.gene_annot.gene_name.unique()):
-                for j in self.get_gene_jacobian(g):
+                for j in self.get_gene_jacobian(g, multiply_input=True):
                     jacobs.append(j.motif_summary().T)
             jacobs_df = pd.concat(jacobs, axis=1).T
             jacobs_df.reset_index().to_feather(
@@ -459,7 +470,8 @@ class Celltype:
 
         selected_index = (
             self.gene_by_motif.data[tf] > self.gene_by_motif.data[tf].quantile(quantile_cutoff))
-        gene_list = self.gene_annot.loc[selected_index].query(
+        selected_genes = self.gene_by_motif.data.index[selected_index]
+        gene_list = self.gene_annot.query('gene_name.isin(@selected_genes)').query(
             'pred>@exp_cutoff').gene_name.unique()
         go = gp.profile(organism='hsapiens', query=list(gene_list), user_threshold=0.05,
                         no_evidences=False, significance_threshold_method=significance_threshold_method)
@@ -861,77 +873,116 @@ class GETCellType(Celltype):
 
 
 class GETHydraCellType(Celltype):
-    def __init__(
-        self,
-        celltype,
-        zarr_path,
-        motif_path,
-    ):
+    def __init__(self, celltype, zarr_path, motif_path):
+        # Initialize parent class attributes that will be needed
+        self._gene_by_motif = None
         self.celltype = celltype
+        self.celltype_name = celltype
         self.zarr_path = zarr_path
         self.motif = NrMotifV1.load_from_pickle(motif_path)
+        self.assets_dir = "assets"  # Default value, could be made configurable
+        self.s3_file_sys = None  # Default value, could be made configurable
 
         self._load_zarr_data()
+        
         # Initialize parent class attributes
         self.features = list(self.motif.cluster_names) + ['Accessibility']
         self.num_features = len(self.features)
         self.num_region_per_sample = self._zarr_data['input'].shape[1]
         self.num_cls = self._zarr_data['preds']['exp'].shape[2]
+        
         self._process_data()
+        
+        # Process jacobians if available
+        if 'jacobians' in self._zarr_data:
+            self.jacobs = self._zarr_data['jacobians']
 
     def _load_zarr_data(self):
+        """Load zarr data from zarr path."""
+        logging.info(f"Loading zarr data from {self.zarr_path}")
         self._zarr_data = zarr.open(self.zarr_path, mode='r')
         self.genelist = [
             x.strip(' ') for x in self._zarr_data['avaliable_genes'][:].reshape(-1)]
 
     def _process_data(self):
-        self.focus = self._zarr_data['focus'][:]
-        df = []
-        for i in range(self.focus.shape[0]):
-            focus_idx = self.focus[i][self.focus[i] > 0].astype(int)
-            strand = int(self._zarr_data['strand'][i])
-            pred_values = self._zarr_data['preds']['exp'][i,
-                                                          :, strand][focus_idx]
-            obs_values = self._zarr_data['obs']['exp'][i, :, strand][focus_idx]
-            pred_max_idx = np.argmax(pred_values)
-            focus_represent_idx = int(focus_idx[pred_max_idx])
-
-            gene_annot = {
-                'gene_name': self.genelist[i].strip(' '),
-                'Chromosome': self._zarr_data['chromosome'][:].reshape(-1)[i].strip(' '),
-                'Start': self._zarr_data['peak_coord'][i, focus_represent_idx, 0].astype(int),
-                'End': self._zarr_data['peak_coord'][i, focus_represent_idx, 0].astype(int),
-                'Strand': strand,
-                'pred': pred_values[pred_max_idx],
-                'obs': obs_values[pred_max_idx],
-                'accessibility': self._zarr_data['input'][i, focus_represent_idx, -1],
-            }
-            df.append(gene_annot)
-        self.gene_annot = pd.DataFrame(df)
+        """Process data using vectorized operations."""
+        logging.info(f"Processing data for {self.celltype}")
+        
+        # Get all data upfront
+        focus_idx = 100  # Since this was hardcoded in original code
+        avaliable_genes = self._zarr_data['avaliable_genes'][:].reshape(-1)
+        chromosome = self._zarr_data['chromosome'][:].flatten()
+        strands = self._zarr_data['strand'][:].astype(int)
+        peak_coord = self._zarr_data['peak_coord'][:]
+        input_data = self._zarr_data['input'][:]
+        
+        # Get predictions and observations for all genes at once
+        pred_values = np.array([
+            self._zarr_data['preds']['exp'][i, focus_idx, strand] 
+            for i, strand in enumerate(strands)
+        ])
+        obs_values = np.array([
+            self._zarr_data['obs']['exp'][i, focus_idx, strand] 
+            for i, strand in enumerate(strands)
+        ])
+        
+        # Create DataFrame directly
+        self.gene_annot = pd.DataFrame({
+            'gene_name': [x.strip(' ') for x in avaliable_genes],
+            'Chromosome': [x.strip(' ') for x in chromosome],
+            'Start': peak_coord[:, focus_idx, 0].astype(int),
+            'End': peak_coord[:, focus_idx, 1].astype(int),
+            'Strand': strands,
+            'pred': pred_values,
+            'obs': obs_values,
+            'accessibility': input_data[:, focus_idx, -1],
+        })
+        
+        # Create peak annotation DataFrame
         self.peak_annot = pd.DataFrame({
-            'Chromosome': np.repeat(self._zarr_data['chromosome'][:], self.num_region_per_sample),
-            'Start': self._zarr_data['peak_coord'][:, :, 0].flatten().astype(int),
-            'End': self._zarr_data['peak_coord'][:, :, 1].flatten().astype(int),
+            'Chromosome': np.repeat(chromosome, self.num_region_per_sample),
+            'Start': peak_coord[:, :, 0].flatten().astype(int),
+            'End': peak_coord[:, :, 1].flatten().astype(int),
             'Gene': np.repeat(self.genelist, self.num_region_per_sample),
         }).reset_index()
 
     def get_gene_idx(self, gene_name: str):
-        return self.gene_annot[self.gene_annot["gene_name"] == gene_name].index[0]
+        """Get all indices for a given gene name."""
+        return self.gene_annot[self.gene_annot["gene_name"] == gene_name].index.values
 
     def get_gene_strand(self, gene_name: str):
+        """Get strand information for a gene."""
         return self.gene_annot[self.gene_annot["gene_name"] == gene_name]["Strand"].values[0]
 
     def get_gene_jacobian(self, gene_name: str, multiply_input=True):
-        i = self.get_gene_idx(gene_name)
+        """Get jacobians for all TSS of a gene."""
+        indices = self.get_gene_idx(gene_name)
         strand = self.get_gene_strand(gene_name)
-        jacob = self._zarr_data['jacobians']['exp'][str(strand)]['input'][i]
-        input = self._zarr_data['input'][i]
-        if multiply_input:
-            jacob = jacob * input
-
-        return [OneGeneJacobian(gene_name, jacob, self.peak_annot.query(f"Gene == '{gene_name}'"), self.features, self.num_cls, self.num_region_per_sample, self.num_features)]
+        
+        jacobians = []
+        for i in indices:
+            jacob = self._zarr_data['jacobians']['exp'][str(strand)]['input'][i]
+            input_data = self._zarr_data['input'][i]
+            
+            if multiply_input:
+                jacob = jacob * input_data
+            
+            jacobians.append(
+                OneGeneJacobian(
+                    gene_name=gene_name,
+                    data=jacob,
+                    region=self.peak_annot.query(f"Gene == '{gene_name}'"),
+                    features=self.features,
+                    num_cls=self.num_cls,
+                    num_region_per_sample=self.num_region_per_sample,
+                    num_features=self.num_features
+                )
+            )
+        
+        return jacobians
 
     def get_gene_chromosome(self, gene_name: str):
+        """Get the chromosome of a gene."""
         return self.gene_annot[self.gene_annot["gene_name"] == gene_name]["Chromosome"].values[0]
 
     def __repr__(self) -> str:
@@ -957,6 +1008,91 @@ class GETHydraCellType(Celltype):
             zarr_path=zarr_path,
             motif_path=motif_path
         )
+
+    def get_gene_by_motif(self, overwrite=False):
+        """
+        Override parent method to handle gene by motif analysis for hydra cell type.
+        Now processes all TSS sites for each gene.
+        """
+        if 'gene_by_motif' in self._zarr_data and not overwrite:
+            gene_by_motif_values = self._zarr_data['gene_by_motif'][:]
+            gene_by_motif_df = pd.DataFrame(gene_by_motif_values, index=self.gene_annot['gene_name'].unique(), columns=self.features)
+        else:
+            all_genes = self.gene_annot['gene_name'].unique()
+            motif_data = []
+            
+            for gene in tqdm(all_genes, desc="Processing genes for motif analysis"):
+                try:
+                    # Get jacobians for all TSS
+                    jacobs = self.get_gene_jacobian(gene, multiply_input=True)
+                    
+                    # Calculate motif summary for each TSS and average them
+                    motif_summaries = []
+                    for jacob in jacobs:
+                        motif_summary = jacob.motif_summary(stats="mean")
+                        motif_summaries.append(motif_summary)
+                    
+                    # Average across all TSS
+                    avg_motif_summary = pd.concat(motif_summaries, axis=1).mean(axis=1)
+                    motif_data.append(avg_motif_summary)
+                except Exception as e:
+                    print(f"Error processing gene {gene}: {str(e)}")
+                    continue
+            
+            # Create DataFrame with gene by motif data
+            gene_by_motif_df = pd.DataFrame(motif_data, index=all_genes)
+
+            # save to zarr
+            self._zarr_data = zarr.open(self.zarr_path, mode='a')
+            self._zarr_data.create_dataset('gene_by_motif', data=gene_by_motif_df.values, overwrite=True)
+        self._gene_by_motif = GeneByMotif(
+            celltype=self.celltype,
+            interpret_dir=os.path.dirname(self.zarr_path),
+            jacob=gene_by_motif_df,
+            s3_file_sys=self.s3_file_sys,
+            zarr_data_path=self.zarr_path
+        )
+        return self._gene_by_motif
+
+    def plot_gene_motifs(self, gene, motif, overwrite=False):
+        """
+        Override parent method to ensure compatibility with hydra cell type.
+        """
+        r = self.get_gene_jacobian_summary(gene, 'motif')
+        m = r.sort_values(ascending=False).head(10).index.values
+        fig, ax = plt.subplots(2, 5, figsize=(10, 4), sharex=False, sharey=False)
+        
+        for i, m_i in enumerate(m):
+            if not path_exists_with_s3(
+                file_path=f'{self.assets_dir}{m_i.replace("/", "_")}.png',
+                s3_file_sys=self.s3_file_sys
+            ) or overwrite:
+                self.motif.get_motif_cluster_by_name(m_i).seed_motif.plot_logo(
+                    filename=f'{self.assets_dir}{m_i.replace("/", "_")}.png',
+                    logo_title='',
+                    size='medium',
+                    ic_scale=True
+                )
+                
+            if self.s3_file_sys:
+                with self.s3_file_sys.open(f'{self.assets_dir}{m_i.replace("/", "_")}.png', "rb") as f:
+                    img = plt.imread(BytesIO(f.read()))
+            else:
+                img = plt.imread(f'{self.assets_dir}{m_i.replace("/", "_")}.png')
+                
+            ax[i//5][i % 5].imshow(img)
+            ax[i//5][i % 5].axis('off')
+            
+            if m_i in self.motif.cluster_gene_list.keys():
+                motif_cluster_genes = self.motif.cluster_gene_list[m_i]
+                try:
+                    ax[i//5][i % 5].set_title(f'{m_i}:{self.get_highest_exp_genes(motif_cluster_genes)}')
+                except:
+                    ax[i//5][i % 5].set_title(f'{m_i}')
+            else:
+                ax[i//5][i % 5].set_title(f'{m_i}')
+
+        return fig, ax
 
 class OneTSSJacobian:
     """Jacobian data for one TSS."""
@@ -1108,112 +1244,106 @@ class OneGeneJacobian(OneTSSJacobian):
 
 
 class GeneByMotif(object):
-    """Gene by motif jacobian data."""
+    """Gene by motif jacobian data.
+    
+    This class can work with both:
+    1. Old directory structure using {interpret_dir}/allgenes/{celltype}.zarr
+    2. New directory structure using zarr_data_path
+    
+    If zarr_data_path is provided, it takes precedence over interpret_dir.
+    """
 
     def __init__(
         self,
-        celltype,
-        interpret_dir,
-        jacob,
-        s3_file_sys=None
+        celltype=None,
+        interpret_dir=None,
+        jacob=None,
+        s3_file_sys=None,
+        zarr_data_path=None
     ) -> None:
         self.celltype = celltype
         self.data = jacob
         self.interpret_dir = interpret_dir
+        self.zarr_data_path = zarr_data_path
         self.s3_file_sys = s3_file_sys
         self._corr = None
         self._causal = None
 
-    def __repr__(self) -> str:
-        return f"""Celltype: {self.celltype}
-        Jacob shape: {self.data.shape}
+    @staticmethod
+    def _process_permutation(args):
+        """Process a single permutation.
+        
+        Args:
+            args (tuple): Tuple containing (index, data, permute_columns, self)
+            
+        Returns:
+            tuple: (index, causal_graph)
         """
+        i, data, permute_columns, instance = args
+        permuted_data = data.iloc[:, np.random.permutation(
+            data.shape[1])] if permute_columns else data.copy()
+        causal_g = instance.create_causal_graph(permuted_data)
+        return i, causal_g
 
-    @property
-    def corr(self):
-        """Get the correlation."""
-        if self._corr is None:
-            self._corr = self.get_corr()
-        return self._corr
-
-    @corr.setter
-    def corr(self, value):
-        self._corr = value
-
-    def get_corr(self, method="spearman", diagal_to_zero=True):
-        """Get the motif correlation."""
-        corr = self.data.corr(method=method)
-        if diagal_to_zero:
-            corr = self.set_diagnal_to_zero(corr)
-        return corr
-
-    @property
-    def causal(self):
+    def get_causal(self, edgelist_file=None, permute_columns=True, n=3, overwrite=False, max_workers=None):
         """Get the causal graph."""
-        if self._causal is None:
-            self._causal = self.get_causal()
-        return self._causal
-
-    @causal.setter
-    def causal(self, value):
-        self._causal = value
-
-    def get_causal(self, edgelist_file=None, permute_columns=True, n=3, overwrite=False):
+        # Try loading from edgelist if provided
         if edgelist_file is not None and path_exists_with_s3(
             edgelist_file, s3_file_sys=self.s3_file_sys
         ) and not overwrite:
             return nx.read_weighted_edgelist(edgelist_file, create_using=nx.DiGraph)
 
-        zarr_data_path = os.path.join(
-            self.interpret_dir, self.celltype, "allgenes", f"{self.celltype}.zarr")
+        # Determine which zarr path to use
+        zarr_path = self.zarr_data_path
+        if zarr_path is None:
+            zarr_path = os.path.join(
+                self.interpret_dir, self.celltype, "allgenes", f"{self.celltype}.zarr")
 
-        if path_exists_with_s3(zarr_data_path+"/causal", s3_file_sys=self.s3_file_sys) and not overwrite:
-            return self.load_causal_from_zarr(zarr_data_path)
+        # Check if causal data exists in zarr
+        if path_exists_with_s3(zarr_path, s3_file_sys=self.s3_file_sys) and not overwrite:
+            try:
+                return self.load_causal_from_zarr(zarr_path)
+            except Exception as e:
+                print(f"Failed to load from zarr: {str(e)}")
 
+        # Calculate causal data if not found
         data = zscore(self.data, axis=0)
-
         zarr_data = load_zarr_with_s3(
-            zarr_data_path,
+            zarr_path,
             mode="a",
             s3_file_sys=self.s3_file_sys
         )
 
-        for i in tqdm(range(n)):
-            if not f"causal_{i}" in zarr_data.keys() or overwrite:
-                permuted_data = data.iloc[:, np.random.permutation(
-                    data.shape[1])] if permute_columns else data.copy()
-                causal_g = self.create_causal_graph(permuted_data)
-                self.save_causal_to_zarr(zarr_data, causal_g, i)
+        # Calculate permutations in parallel
+        pending_indices = [i for i in range(n) if not f"causal_{i}" in zarr_data.keys() or overwrite]
+        if pending_indices:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Create arguments for each permutation - include self instance
+                args_list = [(i, data, permute_columns, self) for i in pending_indices]
+                
+                # Process permutations in parallel and save results
+                for i, causal_g in tqdm(
+                    executor.map(self._process_permutation, args_list),
+                    total=len(pending_indices),
+                    desc="Processing permutations"
+                ):
+                    self.save_causal_to_zarr(zarr_data, causal_g, i)
 
-        # Load all n numpy arrays and compute the average
+        # Compute and save average
         average_causal = self.compute_average_causal(zarr_data, n)
+        zarr_data.array("causal", average_causal, dtype="float32", overwrite=True)
 
-        # Save the average to 'causal' in zarr
-        zarr_data.array("causal", average_causal,
-                        dtype="float32", overwrite=True)
-
-        # create networkx graph from average_causal
+        # Create final graph
         causal_g = nx.from_numpy_array(average_causal, create_using=nx.DiGraph)
         causal_g = nx.relabel_nodes(causal_g, dict(
             zip(range(len(self.data.columns)), self.data.columns)))
 
+        # Save edgelist if path provided
         if edgelist_file:
             nx.write_weighted_edgelist(causal_g, edgelist_file)
 
         return causal_g
-
-    def load_causal_from_zarr(self, zarr_data_path):
-        zarr_data = load_zarr_with_s3(
-            file_path=zarr_data_path,
-            mode="a",
-            s3_file_sys=self.s3_file_sys
-        )
-        causal_g = nx.from_numpy_array(
-            zarr_data["causal"][:], create_using=nx.DiGraph)
-        causal_g = nx.relabel_nodes(causal_g, dict(
-            zip(range(len(self.data.columns)), self.data.columns)))
-        return causal_g
-
+    
     def create_causal_graph(self, data):
         try:
             import cdt
@@ -1222,19 +1352,51 @@ class GeneByMotif(object):
             return None
         model = cdt.causality.graph.LiNGAM()
         output = model.predict(data)
-        causal_g = preprocess_net(output.copy())
+        causal_g = preprocess_net(output.copy(), remove_nodes=False, detect_communities=False)
         causal_g_numpy = nx.to_numpy_array(
             causal_g, dtype="float32", nodelist=self.data.columns)
         causal_g = nx.from_numpy_array(causal_g_numpy, create_using=nx.DiGraph)
         causal_g = nx.relabel_nodes(causal_g, dict(
             zip(range(len(self.data.columns)), self.data.columns)))
         return causal_g
+    
+    def load_causal_from_zarr(self, zarr_data_path):
+        """Load causal data from zarr file.
+        
+        Supports both old and new zarr structures.
+        """
+        zarr_data = load_zarr_with_s3(
+            file_path=zarr_data_path,
+            mode="r",  # Changed to read-only mode since we're just loading
+            s3_file_sys=self.s3_file_sys
+        )
+        
+        # Try to find causal data in zarr structure
+        if "causal" in zarr_data:
+            causal_array = zarr_data["causal"][:]
+        elif "gene_by_motif_causal" in zarr_data:  # Alternative location
+            causal_array = zarr_data["gene_by_motif_causal"][:]
+        else:
+            raise KeyError("No causal data found in zarr file")
 
-    def save_causal_to_zarr(self, zarr_data, causal_g, index):
+        causal_g = nx.from_numpy_array(causal_array, create_using=nx.DiGraph)
+        causal_g = nx.relabel_nodes(causal_g, dict(
+            zip(range(len(self.data.columns)), self.data.columns)))
+        return causal_g
+
+    def save_causal_to_zarr(self, zarr_data, causal_g, index=None):
+        """Save causal data to zarr file.
+        
+        Args:
+            zarr_data: Zarr group to save to
+            causal_g: Causal graph to save
+            index: If provided, saves as causal_{index}, otherwise saves as causal
+        """
         causal_g_numpy = nx.to_numpy_array(
             causal_g, dtype="float32", nodelist=self.data.columns)
-        zarr_data.array(f"causal_{index}", causal_g_numpy,
-                        dtype="float32", overwrite=True)
+        
+        array_name = f"causal_{index}" if index is not None else "causal"
+        zarr_data.array(array_name, causal_g_numpy, dtype="float32", overwrite=True)
 
     def compute_average_causal(self, zarr_data, n):
         causal_arrays = [zarr_data[f"causal_{i}"] for i in range(n)]

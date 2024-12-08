@@ -61,7 +61,7 @@ def plot_comm(G, figsize=(10, 10), title='Network structure', savefig=False):
     # external edges
     nx.draw(
         G,
-        pos=nx.spring_layout(G),
+        pos=nx.nx_agraph.graphviz_layout(G),
         node_size=0,
         edgelist=external,
         width = weights,
@@ -72,7 +72,7 @@ def plot_comm(G, figsize=(10, 10), title='Network structure', savefig=False):
     # internal edges
     nx.draw(
         G, 
-        pos=nx.spring_layout(G),
+        pos=nx.nx_agraph.graphviz_layout(G),
         node_size=100,
         edgelist=internal,
         ax=ax,
