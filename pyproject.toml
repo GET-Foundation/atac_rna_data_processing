@@ -1,8 +1,23 @@
-[tool.atac_rna_data_processing]
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "atac_rna_data_processing"
 version = "1.0.0"
 description = "A simple Python project"
-authors = ["Xi Fu <fu.xi@columbia.edu>"]
+authors = [
+    {name = "Xi Fu", email = "fu.xi@columbia.edu"}
+]
+requires-python = ">=3.10"
 
-[tool.atac_rna_data_processing.dependencies]
-python = "^3.10"
+[tool.setuptools.packages]
+find = {}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atac_rna_data_processing*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"atac_rna_data_processing" = ["data/*.pkl", "data/gencode.v40.hg38.feather"]
