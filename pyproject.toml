@@ -36,13 +36,10 @@ dependencies = [
     "pyfaidx"
 ]
 
-[tool.setuptools.packages]
-find = {}
-
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["atac_rna_data_processing*"]
-namespaces = false
+where = ["."]  # Start looking for packages inside the root folder
+exclude = ["test*"]  # Exclude test packages
+include = ["atac_rna_data_processing*"]  # Only include packages starting with "atac_rna_data_processing"
 
 [tool.setuptools.package-data]
 "atac_rna_data_processing" = ["data/*.pkl", "data/gencode.v40.hg38.feather"]
