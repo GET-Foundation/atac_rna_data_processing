@@ -1,0 +1,2 @@
+include atac_rna_data_processing/data/*.pkl
+include atac_rna_data_processing/data/gencode.v40.hg38.feather 

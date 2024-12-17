@@ -10,6 +10,31 @@ authors = [
     {name = "Xi Fu", email = "fu.xi@columbia.edu"}
 ]
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyranges",
+    "scipy",
+    "PyYAML",
+    "zarr",
+    "numcodecs",
+    "pyBigWig",
+    "matplotlib",
+    "networkx",
+    "plotly",
+    "seaborn",
+    "tqdm",
+    "cdt",
+    "pysam",
+    "requests",
+    "seqlogo",
+    "MOODS-python",
+    "urllib3",
+    "pyliftover",
+    "biopython",
+    "gprofiler",
+    "pyfaidx"
+]
 
 [tool.setuptools.packages]
 find = {}
