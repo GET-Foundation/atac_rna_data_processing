@@ -1,6 +1,8 @@
 # Repository for data processing workflows of ATAC/RNA data
 This is the repository of data processing workflows for train the regulatory models using ATAC/RNA-seq data.
 
+> Note: this repo is now deprecated. Data processing code has been refactored to [get_model repo](https://github.com/GET-Foundation/get_model/blob/master/tutorials/preprocess_utils.py); Data analysis code is now a independent package at [gcell](https://github.com/GET-Foundation/gcell).
+
 
 ## Installation
 
